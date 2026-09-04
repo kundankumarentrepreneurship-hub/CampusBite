@@ -7,13 +7,20 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const { Pool } = pg;
+const { Pool, Client } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-campusbite-secret';
 if (!DATABASE_URL) console.warn('DATABASE_URL is not set. The server cannot use PostgreSQL until it is configured.');
 const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false }) : null;
+
+// Dedicated PostgreSQL listener for authoritative live menu updates. This connection
+// is intentionally separate from the API pool so LISTEN cannot consume an API slot.
+const menuRealtimeClients = new Set();
+let menuRealtimeListenerClient = null;
+let menuRealtimeReconnectTimer = null;
+let menuRealtimeStarting = false;
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
@@ -233,6 +240,60 @@ async function init(){
     // MUST exist before the transaction can commit.
     const orderIdCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='wallet_transactions' AND column_name='order_id'`);
     if (orderIdCheck.rowCount !== 1) throw new Error('Database migration verification failed: wallet_transactions.order_id is missing');
+
+    // Authoritative live-menu event source. PostgreSQL emits only after a
+    // transaction commits, so customers never receive an update that was later
+    // rolled back. The trigger covers availability, stock and price mutations.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION campusbite_notify_menu_change()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $fn$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          PERFORM pg_notify('campusbite_menu_changed', json_build_object(
+            'op', TG_OP,
+            'id', OLD.id,
+            'shop', OLD.shop,
+            'name', OLD.name
+          )::text);
+          RETURN OLD;
+        ELSIF TG_OP = 'INSERT' THEN
+          PERFORM pg_notify('campusbite_menu_changed', json_build_object(
+            'op', TG_OP,
+            'id', NEW.id,
+            'shop', NEW.shop,
+            'name', NEW.name,
+            'price', NEW.price,
+            'stock', NEW.stock,
+            'available', NEW.available
+          )::text);
+          RETURN NEW;
+        ELSIF OLD.available IS DISTINCT FROM NEW.available
+           OR OLD.stock IS DISTINCT FROM NEW.stock
+           OR OLD.price IS DISTINCT FROM NEW.price
+           OR OLD.name IS DISTINCT FROM NEW.name
+           OR OLD.shop IS DISTINCT FROM NEW.shop THEN
+          PERFORM pg_notify('campusbite_menu_changed', json_build_object(
+            'op', TG_OP,
+            'id', NEW.id,
+            'shop', NEW.shop,
+            'name', NEW.name,
+            'price', NEW.price,
+            'stock', NEW.stock,
+            'available', NEW.available
+          )::text);
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$
+    `);
+    await client.query(`DROP TRIGGER IF EXISTS campusbite_menu_changed_trigger ON menu_items`);
+    await client.query(`
+      CREATE TRIGGER campusbite_menu_changed_trigger
+      AFTER INSERT OR UPDATE OR DELETE ON menu_items
+      FOR EACH ROW EXECUTE FUNCTION campusbite_notify_menu_change()
+    `);
 
     await client.query('COMMIT');
   }catch(e){
@@ -480,6 +541,82 @@ app.post('/api/customer/wallet/topup',auth,customerRole,async(req,res)=>{try{con
 app.post('/api/customer/autopay',auth,customerRole,async(req,res)=>{const client=await (await db()).connect();try{const enabled=!!req.body.enabled,threshold=Number(req.body.threshold)||200,amount=Number(req.body.amount)||500;await client.query('BEGIN');const s=(await client.query('SELECT * FROM customers WHERE id=$1 FOR UPDATE',[req.user.id])).rows[0];if(!s)throw new Error('Customer not found');await client.query('UPDATE customers SET autopay_enabled=$1,autopay_threshold=$2,autopay_amount=$3 WHERE id=$4',[enabled,threshold,amount,req.user.id]);let balance=Number(s.wallet_balance);if(enabled && balance<=threshold){balance+=amount;await client.query('UPDATE customers SET wallet_balance=wallet_balance+$1 WHERE id=$2',[amount,req.user.id]);await client.query(`INSERT INTO wallet_transactions(customer_id,icon,title,sub,amount,type) VALUES($1,'🔄','Auto-pay top-up',$2,$3,'credit')`,[req.user.id,`Automatic refill • threshold ₹${threshold}`,amount]);}await client.query('COMMIT');res.json({autopay:{enabled,threshold,amount},wallet:balance});}catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({error:'Auto-pay update failed'});}finally{client.release();}});
 
 
+async function broadcastMenuSnapshot(payload){
+  const message=`data: ${JSON.stringify(payload)}\n\n`;
+  for(const res of menuRealtimeClients){
+    try{res.write(message);}
+    catch(e){menuRealtimeClients.delete(res);try{res.end();}catch{}}
+  }
+}
+
+async function startMenuRealtimeListener(){
+  if(!DATABASE_URL || menuRealtimeListenerClient || menuRealtimeStarting)return;
+  menuRealtimeStarting=true;
+  let client=null;
+  try{
+    // Use a standalone pg.Client rather than a Pool client. LISTEN is a long-lived
+    // connection and must never consume an API connection from the request pool.
+    client=new Client({
+      connectionString:DATABASE_URL,
+      ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false,
+      connectionTimeoutMillis:5000
+    });
+    await client.connect();
+    menuRealtimeListenerClient=client;
+    client.on('notification',msg=>{
+      if(msg.channel!=='campusbite_menu_changed')return;
+      try{
+        const payload=JSON.parse(msg.payload||'{}');
+        void broadcastMenuSnapshot(payload);
+      }catch(e){console.error('Invalid menu realtime payload:',e);}
+    });
+    let closed=false;
+    const scheduleReconnect=()=>{
+      if(closed)return;
+      closed=true;
+      if(menuRealtimeListenerClient===client)menuRealtimeListenerClient=null;
+      if(menuRealtimeReconnectTimer || !dbReady)return;
+      menuRealtimeReconnectTimer=setTimeout(()=>{
+        menuRealtimeReconnectTimer=null;
+        void startMenuRealtimeListener();
+      },2000);
+    };
+    client.on('error',e=>{
+      console.error('Menu realtime listener error:',e.message);
+      scheduleReconnect();
+    });
+    client.on('end',scheduleReconnect);
+    await client.query('LISTEN campusbite_menu_changed');
+    console.log('CampusBite menu realtime listener ready');
+  }catch(e){
+    if(menuRealtimeListenerClient===client)menuRealtimeListenerClient=null;
+    try{if(client)await client.end();}catch{}
+    menuRealtimeListenerClient=null;
+    console.error('CampusBite menu realtime listener startup failed:',e.message);
+    if(dbReady && !menuRealtimeReconnectTimer){
+      menuRealtimeReconnectTimer=setTimeout(()=>{
+        menuRealtimeReconnectTimer=null;
+        void startMenuRealtimeListener();
+      },3000);
+    }
+  }finally{menuRealtimeStarting=false;}
+}
+app.get('/api/menu/events',async(req,res)=>{
+  res.status(200);
+  res.setHeader('Content-Type','text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control','no-cache, no-transform');
+  res.setHeader('Connection','keep-alive');
+  res.setHeader('X-Accel-Buffering','no');
+  if(typeof res.flushHeaders==='function')res.flushHeaders();
+  menuRealtimeClients.add(res);
+  // Send an immediate heartbeat so proxies establish the stream without waiting.
+  res.write(': connected\n\n');
+  const heartbeat=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch{}},15000);
+  const cleanup=()=>{clearInterval(heartbeat);menuRealtimeClients.delete(res);};
+  req.on('close',cleanup);
+  res.on('error',cleanup);
+});
+
 app.get('/api/menu',async(req,res)=>{try{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');const d=await db();const rows=(await d.query('SELECT id,shop,name,price,stock,available FROM menu_items ORDER BY id')).rows;res.json({items:rows});}catch(e){console.error(e);res.status(500).json({error:'Menu unavailable'});}});
 app.patch('/api/staff/menu/:id',auth,role('staff'),async(req,res)=>{
   try{
@@ -522,7 +659,9 @@ const server = app.listen(PORT,'0.0.0.0',()=>{
         await init();
         dbReady=true;
         console.log('CampusBite database initialization complete');
-        startMenuRealtimeListener().catch(e=>console.error('Menu realtime startup failed',e));
+        // Start the realtime listener after the database transaction commits.
+        // Listener failure must never invalidate a successful DB initialization.
+        void startMenuRealtimeListener();
       }catch(e){
         console.error('CampusBite database initialization failed:',e);
         console.log('Retrying database initialization in 5 seconds...');
@@ -533,5 +672,14 @@ const server = app.listen(PORT,'0.0.0.0',()=>{
   initializeWithRetry();
 });
 
-process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
-process.on('SIGINT',()=>server.close(()=>process.exit(0)));
+async function shutdown(){
+  for(const res of menuRealtimeClients){try{res.end();}catch{}}
+  menuRealtimeClients.clear();
+  if(menuRealtimeListenerClient){try{await menuRealtimeListenerClient.end();}catch{} menuRealtimeListenerClient=null;}
+  if(menuRealtimeReconnectTimer)clearTimeout(menuRealtimeReconnectTimer);
+  await new Promise(resolve=>server.close(resolve));
+  if(pool)await pool.end().catch(()=>{});
+  process.exit(0);
+}
+process.on('SIGTERM',()=>void shutdown());
+process.on('SIGINT',()=>void shutdown());

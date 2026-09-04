@@ -1466,7 +1466,7 @@ window.addEventListener("load",()=>{
           if(changed){
             const u=user();
             if(u?.role==='customer')renderLiveMenu();
-            if(u?.role==='staff' && typeof renderStaffMenuOnly==='function')renderStaffMenuOnly();
+            if(u?.role==='staff' && typeof renderStaffMenuOnly==='function' && staffMenuToggleInFlight.size===0)renderStaffMenuOnly();
           }
         }catch(err){}
       };
@@ -1578,17 +1578,30 @@ window.addEventListener("load",()=>{
 
   let staffMenuLoadInFlight=null;
   let staffMenuLoadQueued=false;
+  // Per-item revisions close the last subtle race: a GET that started before a
+  // toggle can finish after the PATCH and otherwise overwrite the confirmed
+  // state with its older snapshot.
+  const staffMenuItemRevision=new Map();
   async function loadStaffMenu(){
     if(!token('/api/staff/orders')||user()?.role!=="staff")return;
+    bindStaffMenuControls();
     if(staffMenuLoadInFlight){staffMenuLoadQueued=true;return staffMenuLoadInFlight;}
     staffMenuLoadInFlight=(async()=>{
       try{
+        // Capture the revision of every item at the instant this GET begins.
+        // If an item is toggled while this request is in flight, its revision
+        // changes and this older response is forbidden from overwriting the
+        // newer PATCH result.
+        const requestRevisions=new Map(MENU.map(m=>[Number(m.id),Number(staffMenuItemRevision.get(Number(m.id))||0)]));
         const md=await api('/api/menu');
         const byId=new Map((md.items||[]).map(x=>[Number(x.id),x]));
         MENU.forEach(m=>{
-          const fresh=byId.get(Number(m.id));
+          const id=Number(m.id),fresh=byId.get(id);
           if(fresh){
-            m.available=!!fresh.available;
+            const revisionStillCurrent=Number(staffMenuItemRevision.get(id)||0)===Number(requestRevisions.get(id)||0);
+            // A currently committed toggle OR any newer toggle that began after
+            // this GET started makes this response stale for availability.
+            if(revisionStillCurrent&&!staffMenuToggleInFlight.has(id))m.available=!!fresh.available;
             if(fresh.price!=null)m.price=Number(fresh.price);
             if(fresh.stock!=null)m.stock=Number(fresh.stock);
           }
@@ -1609,7 +1622,52 @@ window.addEventListener("load",()=>{
     const root=$('menuControl');
     if(!root||!shop)return;
     const shopMenu=MENU.filter(x=>x.shop===shop);
-    root.innerHTML=shopMenu.map(x=>`<div class="row staff-menu-row"><span>${x.emoji} ${x.name}</span><button class="availability-toggle ${x.available?'is-available':'is-unavailable'}" data-server-menu="${x.id}" ${staffMenuToggleInFlight.has(Number(x.id))?'disabled':''}>${x.available?'Available ✓':'Not available'}</button></div>`).join('');
+    root.innerHTML=shopMenu.map(x=>`<div class="row staff-menu-row"><span>${x.emoji} ${x.name}</span><button type="button" class="availability-toggle ${x.available?'is-available':'is-unavailable'}" data-server-menu="${x.id}" ${staffMenuToggleInFlight.has(Number(x.id))?'disabled':''}>${x.available?'Available ✓':'Not available'}</button></div>`).join('');
+  }
+
+  async function toggleStaffMenuAvailability(id){
+    id=Number(id);
+    if(!Number.isInteger(id)||staffMenuToggleInFlight.has(id))return;
+    const item=MENU.find(x=>Number(x.id)===id);
+    const shop=user()?.shop;
+    if(!item||user()?.role!=="staff"||item.shop!==shop)return;
+    const previous=!!item.available;
+    const next=!previous;
+    staffMenuItemRevision.set(id,Number(staffMenuItemRevision.get(id)||0)+1);
+    staffMenuToggleInFlight.add(id);
+    // Optimistic local update makes the staff console acknowledge the single click
+    // immediately, while the server remains the source of truth.
+    item.available=next;
+    renderStaffMenuOnly();
+    try{
+      const d=await api('/api/staff/menu/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify({available:next})});
+      const serverItem=d?.item;
+      if(!serverItem)throw new Error('The server did not confirm the menu update');
+      item.available=!!serverItem.available;
+      broadcastAvailabilityChange(item);
+      toast(item.available?'Available ✓':'Not available');
+    }catch(e){
+      item.available=previous;
+      toast(e.message||'Availability update failed');
+      try{await loadStaffMenu();}catch{}
+    }finally{
+      staffMenuToggleInFlight.delete(id);
+      renderStaffMenuOnly();
+    }
+  }
+
+  function bindStaffMenuControls(){
+    const root=$('menuControl');
+    if(!root||root.dataset.menuToggleBound==='1')return;
+    root.dataset.menuToggleBound='1';
+    // Event delegation survives every menu render, so replacing innerHTML can
+    // never silently remove the click handler.
+    root.addEventListener('click',e=>{
+      const button=e.target.closest('[data-server-menu]');
+      if(!button||!root.contains(button))return;
+      e.preventDefault();
+      void toggleStaffMenuAvailability(button.dataset.serverMenu);
+    });
   }
 
   async function loadStaff(){
