@@ -392,7 +392,7 @@ app.get('/api/customer/state',auth,customerRole,async(req,res)=>{
 
 async function validateOrderForRequest(client, reqUserId, body){
   const {items,slot,shop}=body;
-  const allowedPickupSlots=new Set(['ASAP','9:00 AM','9:30 AM','10:00 AM','10:30 AM','11:00 AM','11:30 AM','12:00 PM','12:30 PM','1:00 PM','1:30 PM','2:00 PM','2:30 PM','3:00 PM']);
+  const allowedPickupSlots=new Set(['ASAP',...Array.from({length:13},(_,i)=>{const total=15*60+i*30;const h24=Math.floor(total/60),m=total%60;const h=h24%12||12;return `${h}:${String(m).padStart(2,'0')} ${h24<12?'AM':'PM'}`;})]);
   if(!shops.includes(shop)||!Array.isArray(items)||!items.length||!allowedPickupSlots.has(String(slot||''))) throw Object.assign(new Error('Please select a valid pickup time'),{status:400});
   const normalized=items.map(i=>({id:Number(i.id),q:Number(i.q),name:String(i.name||''),emoji:String(i.emoji||'🍱')}));
   if(normalized.some(i=>!Number.isInteger(i.id)||!Number.isInteger(i.q)||i.q<1||i.q>20)) throw Object.assign(new Error('Invalid quantity'),{status:400});

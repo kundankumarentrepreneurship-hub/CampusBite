@@ -7,8 +7,8 @@ This package is the single deployment candidate for CampusBite.
 - Customer and staff clients use the same Node/Express API.
 - PostgreSQL is the source of truth for customers, wallets, transactions, orders, menu availability, and staff status changes.
 - Browser localStorage is used only for the login token/session and the selected-shop UI preference. Orders, wallet balances, expenditure, transactions, and auto-pay are NOT stored in localStorage.
-- Customer clients poll the API every 3 seconds for account/order/menu updates.
-- Staff clients poll the API every 3 seconds for shop orders and daily summary data.
+- Customer clients use a PostgreSQL-backed Server-Sent Events stream for immediate menu availability/stock/price updates, with low-frequency polling as a reconnect fallback. Account/order state is refreshed every 2 seconds.
+- Staff clients use a controlled 2-second refresh for orders/summary data and an isolated menu lifecycle so availability toggles cannot race with background redraws.
 - Staff status transitions are enforced server-side: Received -> Preparing -> Ready -> Completed.
 - Staff access is restricted to the authenticated staff member's assigned shop.
 - Daily revenue/order counts use the Asia/Kolkata calendar date and are recalculated on every staff refresh/poll, so they roll over automatically when the date changes.
@@ -53,7 +53,7 @@ These are fictional demo accounts. Do not use real university credentials in the
 
 ## Customer pickup time
 
-Checkout supports ASAP or scheduled pickup from 3:00 PM through 9:00 PM in 30-minute increments. The server validates the selected pickup slot.
+Checkout supports ASAP or scheduled pickup from 3:00 PM through 9:00 PM in 30-minute increments. The server validates the selected pickup slot; scheduled pickup supports 9:00 AM through 9:00 PM in 30-minute increments.
 
 
 
