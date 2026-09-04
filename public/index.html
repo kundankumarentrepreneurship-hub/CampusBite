@@ -1572,8 +1572,54 @@ window.addEventListener("load",()=>{
       }
     }catch(e){}
   }
+  let staffLoadInFlight=null;
+  const staffMenuToggleInFlight=new Set();
+  let staffLoadQueued=false;
+
+  let staffMenuLoadInFlight=null;
+  let staffMenuLoadQueued=false;
+  async function loadStaffMenu(){
+    if(!token('/api/staff/orders')||user()?.role!=="staff")return;
+    if(staffMenuLoadInFlight){staffMenuLoadQueued=true;return staffMenuLoadInFlight;}
+    staffMenuLoadInFlight=(async()=>{
+      try{
+        const md=await api('/api/menu');
+        const byId=new Map((md.items||[]).map(x=>[Number(x.id),x]));
+        MENU.forEach(m=>{
+          const fresh=byId.get(Number(m.id));
+          if(fresh){
+            m.available=!!fresh.available;
+            if(fresh.price!=null)m.price=Number(fresh.price);
+            if(fresh.stock!=null)m.stock=Number(fresh.stock);
+          }
+        });
+        // Never replace the live button while an availability commit is in flight.
+        // The menu fetch may finish during the click; rendering waits until the
+        // commit's finally block performs the authoritative reconciliation.
+        if(staffMenuToggleInFlight.size===0 && typeof renderStaffMenuOnly==='function')renderStaffMenuOnly();
+      }catch(e){/* retain last known staff menu state on transient failures */}
+    })();
+    try{return await staffMenuLoadInFlight;}finally{
+      staffMenuLoadInFlight=null;
+      if(staffMenuLoadQueued){staffMenuLoadQueued=false;void loadStaffMenu();}
+    }
+  }
+  function renderStaffMenuOnly(){
+    const shop=user()?.shop;
+    const root=$('menuControl');
+    if(!root||!shop)return;
+    const shopMenu=MENU.filter(x=>x.shop===shop);
+    root.innerHTML=shopMenu.map(x=>`<div class="row staff-menu-row"><span>${x.emoji} ${x.name}</span><button class="availability-toggle ${x.available?'is-available':'is-unavailable'}" data-server-menu="${x.id}" ${staffMenuToggleInFlight.has(Number(x.id))?'disabled':''}>${x.available?'Available ✓':'Not available'}</button></div>`).join('');
+  }
+
   async function loadStaff(){
     if(!token('/api/staff/orders')||user()?.role!=="staff")return;
+    // Never allow the 2-second background poll to overlap a staff refresh.
+    // Overlapping refreshes used to rebuild #menuControl while an availability
+    // PATCH was still in flight, replacing the button and making one click look
+    // like it had not registered.
+    if(staffLoadInFlight){staffLoadQueued=true;return staffLoadInFlight;}
+    staffLoadInFlight=(async()=>{
     try{
       const shop=user().shop;
       // Keep the live order queue independent from optional dashboard metrics.
@@ -1592,26 +1638,15 @@ window.addEventListener("load",()=>{
       const rating=sr&&sr.average!=null?Math.max(0,Math.min(5,Number(sr.average))):null;const ratingStars=$('staffRatingStars'),ratingNumber=$('staffRatingNumber');if(ratingStars){ratingStars.innerHTML=Array.from({length:5},(_,i)=>{const fill=Math.max(0,Math.min(1,(rating==null?0:rating)-i))*100;return `<span class="staff-rating-star" style="--fill:${fill}%">★</span>`}).join('');}if(ratingNumber)ratingNumber.textContent=rating==null?'— / 5':rating.toFixed(1)+' / 5';
       $('queue').innerHTML=active.length?active.map(o=>`<div class="q"><div style="width:100%"><div style="display:flex;justify-content:space-between;gap:10px"><div><b>${o.id}</b><div class="muted">${o.customerName||'Customer'} • ${o.customerCode||''}</div><div class="muted">${o.items.map(i=>i.name+' × '+i.q).join(', ')}</div><div class="muted staff-pickup-time">🕐 Pickup: <b>${o.slot||'ASAP'}</b></div></div><span class="badge">${['Received','Preparing','Ready','Completed'][o.status]}</span></div><div class="statusSteps">${['Received','Preparing','Ready','Completed'].map((label,idx)=>`<button class="secondary statusStep ${idx===o.status?'current':''}" data-server-status="${o.id}" data-target-status="${idx}" ${idx!==o.status+1?'disabled':''}>${idx===o.status?'✓ ':''}${label}</button>`).join('')}</div></div></div>`).join(''):'<div class="empty">No active orders for '+shop+'.</div>';
       document.querySelectorAll('[data-server-status]').forEach(b=>b.onclick=async()=>{const id=b.dataset.serverStatus,next=Number(b.dataset.targetStatus);try{await api('/api/staff/orders/'+encodeURIComponent(id)+'/status',{method:'PATCH',body:JSON.stringify({status:next})});await loadStaff();toast(['Received','Preparing','Ready','Completed'][next]);}catch(e){toast(e.message||'Status update failed');}});
-      // Always hydrate the staff menu from the server before rendering it.
-      // This prevents stale hardcoded MENU availability after refresh/login.
-      try{
-        const md=await api('/api/menu');
-        const byId=new Map((md.items||[]).map(x=>[Number(x.id),x]));
-        MENU.forEach(m=>{
-          const fresh=byId.get(Number(m.id));
-          if(fresh){
-            m.available=!!fresh.available;
-            if(fresh.price!=null)m.price=Number(fresh.price);
-            if(fresh.stock!=null)m.stock=Number(fresh.stock);
-          }
-        });
-      }catch(e){}
-      if(typeof renderWasteIntelligence==='function')renderWasteIntelligence(shop);
-      const shopMenu=MENU.filter(x=>x.shop===shop);$('menuControl').innerHTML=shopMenu.map(x=>`<div class="row staff-menu-row"><span>${x.emoji} ${x.name}</span><button class="availability-toggle ${x.available?'is-available':'is-unavailable'}" data-server-menu="${x.id}">${x.available?'Available ✓':'Not available'}</button></div>`).join('');
-      if(!window.campusBiteStaffMenuHandlerBound){
-        window.campusBiteStaffMenuHandlerBound=true;
-        document.addEventListener('click',async e=>{const b=e.target.closest('[data-server-menu]');if(!b||user()?.role!=="staff"||b.disabled)return;e.preventDefault();e.stopImmediatePropagation();const item=MENU.find(x=>x.id===Number(b.dataset.serverMenu));if(!item)return;b.disabled=true;const previous=!!item.available;item.available=!previous;b.classList.toggle('is-available',item.available);b.classList.toggle('is-unavailable',!item.available);b.textContent=item.available?'Available ✓':'Not available';try{const d=await api('/api/staff/menu/'+item.id,{method:'PATCH',body:JSON.stringify({available:item.available})});item.available=!!d.item.available;broadcastAvailabilityChange(item);toast(item.name+' is now '+(item.available?'available':'not available'));await loadStaff();}catch(err){item.available=previous;toast(err.message||'Availability update failed');}finally{b.disabled=false;}},true);}
+      // Menu control is synchronized by its own lifecycle. Never let the staff
+      // dashboard/order refresh rebuild this DOM while an availability PATCH is in flight.
+      await loadStaffMenu();
     }catch(e){toast(e.message||'Could not sync staff console');}
+    })();
+    try{return await staffLoadInFlight;}finally{
+      staffLoadInFlight=null;
+      if(staffLoadQueued){staffLoadQueued=false;void loadStaff();}
+    }
   }
   function startPolling(){clearInterval(pollTimer);pollTimer=setInterval(()=>{const u=user();if(!u)return;if(u.role==='customer'){const checkoutOpen=$('checkoutModal')?.classList.contains('open'),cartOpen=$('cart')?.classList.contains('active');if(!checkoutOpen&&!cartOpen&&!splitActionBusy){loadCustomerState(true);loadMenu();}}if(u.role==='staff')loadStaff();},2000);}
   function wire(){
