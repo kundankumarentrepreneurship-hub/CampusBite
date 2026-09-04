@@ -387,7 +387,7 @@ body.staff-mode .staff-only-label{display:inline-flex;align-items:center}
 @media(max-width:560px){.wsHero{align-items:flex-start;flex-direction:column}.wsHeroNumber{text-align:left}.wsStats{grid-template-columns:1fr}}
 </style>
 <style id="simple-waste-helper-ui">
-.simpleWasteCard{border:1px solid var(--line);border-radius:17px;background:var(--panel);padding:16px}
+.simpleWasteCard{border:1px solid var(--line);border-radius:17px;background:var(--panel);padding:16px}.staff-waste-spacing{margin-top:28px}
 .simpleWasteHeader{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:13px}
 .simpleWasteTitle{display:flex;align-items:center;gap:9px;font-weight:950;font-size:15px}
 .simpleWasteLive{font-size:8px;font-weight:950;letter-spacing:.08em;padding:5px 8px;border-radius:999px;background:#e8f3ec;color:var(--green)}
@@ -572,7 +572,7 @@ body.staff-mode .staff-only-label{display:inline-flex;align-items:center}
  <div class="dashboard"><div class="metric">Orders<b id="sOrders">24</b><span class="muted">today</span></div><div class="metric">Revenue<b id="sRevenue">₹3,480</b><span class="muted">today</span></div><div class="metric">Prep time<b id="sPrepTime">5.0 min</b><span class="muted">average</span></div><div class="metric">Queue<b id="sQueue">0</b><span class="muted">active</span></div></div>
  <div class="staff-rating-card" aria-label="Shop average customer rating"><div class="staff-rating-label">Average shop rating</div><div class="staff-rating-value"><div id="staffRatingStars" class="staff-rating-stars" aria-hidden="true"></div><span id="staffRatingNumber" class="staff-rating-number">— / 5</span></div></div>
  <div class="section"><h2>Live kitchen queue</h2><span class="muted">Advance orders as prepared</span></div><div class="card"><div id="queue" class="staffQueue"></div></div>
-<div class="simpleWasteCard">
+ <div class="simpleWasteCard staff-waste-spacing">
   <div id="simpleWasteRecommendations"></div>
 </div>
 <div class="section"><h2>Menu control</h2></div><div class="card" id="menuControl"></div>
@@ -886,9 +886,7 @@ function renderWasteIntelligence(shop){
     return {item,todaySold,left,recommended,prepare,hasHistory,recentAverage};
   });
 
-  const totalUnitsSold=Object.values(soldToday).reduce((a,b)=>a+b,0);
-
-  $('simpleWasteRecommendations').innerHTML=`<div class="simpleWasteHeader"><div><div class="simpleWasteTitle">♻️ Food Waste Helper</div><div class="simpleWasteShop">${shop} • live demand guidance</div></div><span class="simpleWasteLive">LIVE DATA</span></div>`+recommendations.map(r=>`
+  $('simpleWasteRecommendations').innerHTML=`<div class="simpleWasteHeader"><div><div class="simpleWasteTitle">${shop}</div><div class="simpleWasteShop">Live demand guidance</div></div><span class="simpleWasteLive">LIVE DATA</span></div>`+recommendations.map(r=>`
     <div class="simpleWasteItem">
       <span class="simpleWasteEmoji">${r.item.emoji}</span>
       <div class="simpleWasteFoodInfo">
@@ -1024,7 +1022,7 @@ window.addEventListener("load",()=>{
 <script id="customer-identity-final-js">
 (function(){
   function getSession(){
-    try { return JSON.parse(localStorage.getItem("campusBiteRoleSession") || "null"); }
+    try { return JSON.parse(sessionStorage.getItem("campusBiteRoleSession") || "null"); }
     catch(e){ return null; }
   }
   function updateIdentity(){
@@ -1269,20 +1267,66 @@ window.addEventListener("load",()=>{
 <script id="campusbite-production-bridge">
 (function(){
   const TOKEN_KEY="campusBiteApiToken";
+  const CUSTOMER_TOKEN_KEY="campusBiteCustomerToken";
+  const STAFF_TOKEN_KEY="campusBiteStaffToken";
   const API="";
+  const ACTIVE_TOKEN_KEY="campusBiteActiveToken";
+  // Authentication is tab-scoped AND role-scoped. A single generic token key is
+  // unsafe for CampusBite's demo because switching customer/staff sessions can
+  // replace the token used by a customer action and produce a misleading 403.
+  // Customer and staff JWTs therefore live in separate sessionStorage slots.
+  try{localStorage.removeItem(TOKEN_KEY);localStorage.removeItem("campusBiteRoleSession");}catch(e){}
   let pollTimer=null;
+  let menuRealtimeSource=null;
+  let menuRealtimeFallbackTimer=null;
   let syncing=false;
   let splitActionBusy=false;
-  function token(){return localStorage.getItem(TOKEN_KEY)||""}
-  function decodeToken(){try{const parts=token().split('.');if(parts.length!==3)return null;let raw=parts[1].replace(/-/g,'+').replace(/_/g,'/');while(raw.length%4)raw+='=';return JSON.parse(atob(raw));}catch(e){return null}}
-  function tokenRole(){const p=decodeToken();return p?.role?String(p.role):null}
-  function tokenIdentity(){const p=decodeToken();return p&&p.role&&p.id?{role:String(p.role),id:Number(p.id),customerCode:p.customerCode||null,shop:p.shop||null}:null}
-  function user(){try{const saved=JSON.parse(localStorage.getItem("campusBiteRoleSession")||"null"),ti=tokenIdentity();if(!ti)return saved;if(!saved||String(saved.role)!==ti.role||(saved.id!=null&&Number(saved.id)!==ti.id)){const repaired=Object.assign({},saved||{},ti);localStorage.setItem("campusBiteRoleSession",JSON.stringify(repaired));return repaired}return saved}catch(e){return null}}
-  function resetMismatchedSession(){const saved=(()=>{try{return JSON.parse(localStorage.getItem("campusBiteRoleSession")||"null")}catch(e){return null}})(),ti=tokenIdentity();if(saved&&ti&&(String(saved.role)!==ti.role||(saved.id!=null&&Number(saved.id)!==ti.id))){localStorage.removeItem(TOKEN_KEY);localStorage.removeItem("campusBiteRoleSession");document.body.classList.remove("staff-mode","customer-mode");if(typeof window.campusBiteSetRoleSession==="function")window.campusBiteSetRoleSession(null);if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();return true}return false}
+  function savedSession(){try{return JSON.parse(sessionStorage.getItem("campusBiteRoleSession")||"null")}catch(e){return null}}
+  function currentRole(){return String(savedSession()?.role||"").toLowerCase()}
+  function tokenForRole(role){
+    const active=sessionStorage.getItem(ACTIVE_TOKEN_KEY)||"";
+    const activePayload=decodeToken(active);
+    if(activePayload?.role===role) return active;
+    return sessionStorage.getItem(role==="customer"?CUSTOMER_TOKEN_KEY:role==="staff"?STAFF_TOKEN_KEY:TOKEN_KEY)||"";
+  }
+  function tokenWithClaim(role){
+    const preferred=tokenForRole(role);
+    const preferredPayload=decodeToken(preferred);
+    // A protected customer action must never borrow a credential from another
+    // role. If the active customer token is malformed/mismatched, fail closed
+    // instead of sending a stale staff/legacy token and receiving a 403.
+    return preferredPayload?.role===role ? preferred : "";
+  }
+  function token(path){
+    const p=String(path||"");
+    if(p.startsWith("/api/customer/")) return tokenWithClaim("customer");
+    if(p.startsWith("/api/staff/")) return tokenWithClaim("staff");
+    return tokenWithClaim(currentRole());
+  }
+  function decodeToken(raw){try{const parts=String(raw||"").split('.');if(parts.length!==3)return null;let body=parts[1].replace(/-/g,'+').replace(/_/g,'/');while(body.length%4)body+='=';return JSON.parse(atob(body));}catch(e){return null}}
+  function tokenRole(path){const p=decodeToken(token(path));return p?.role?String(p.role):null}
+  function tokenIdentity(role){const p=decodeToken(tokenForRole(role||currentRole()));return p&&p.role&&p.id?{role:String(p.role),id:Number(p.id),customerCode:p.customerCode||null,shop:p.shop||null}:null}
+  function user(){try{const saved=savedSession();const role=String(saved?.role||"").toLowerCase();const ti=tokenIdentity(role);if(!ti)return saved;if(String(ti.role)!==role||(saved.id!=null&&Number(saved.id)!==ti.id)){const repaired=Object.assign({},saved||{},ti);sessionStorage.setItem("campusBiteRoleSession",JSON.stringify(repaired));return repaired}return saved}catch(e){return null}}
+  function resetMismatchedSession(){
+    const saved=savedSession();
+    if(!saved||!saved.role)return false;
+    const role=String(saved.role).toLowerCase();
+    const ti=tokenIdentity(role);
+    if(ti&&String(ti.role)!==role){
+      sessionStorage.removeItem(role==="customer"?CUSTOMER_TOKEN_KEY:role==="staff"?STAFF_TOKEN_KEY:TOKEN_KEY);
+      sessionStorage.removeItem("campusBiteRoleSession");
+      document.body.classList.remove("staff-mode","customer-mode");
+      if(typeof window.campusBiteSetRoleSession==="function")window.campusBiteSetRoleSession(null);
+      if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();
+      return true;
+    }
+    return false;
+  }
   async function api(path,opts={}){
     resetMismatchedSession();
     const headers=Object.assign({"Content-Type":"application/json"},opts.headers||{});
-    if(token()) headers.Authorization="Bearer "+token();
+    const authToken=token(path);
+    if(authToken) headers.Authorization="Bearer "+authToken;
     const controller=new AbortController();
     const timeout=setTimeout(()=>controller.abort(),15000);
     try{
@@ -1290,7 +1334,7 @@ window.addEventListener("load",()=>{
       const r=await fetch(API+path,fetchOpts);
       let data={}; try{data=await r.json()}catch(e){}
       if(!r.ok){
-        if(r.status===403 && user()?.role==='customer' && tokenRole()!=='customer'){
+        if(r.status===403 && String(path).startsWith('/api/customer/') && currentRole()==='customer' && tokenRole(path)!=='customer'){
           resetMismatchedSession();
           throw new Error('Your customer session was out of sync. Please sign in again.');
         }
@@ -1305,7 +1349,7 @@ window.addEventListener("load",()=>{
   window.campusBiteApi=api;
   document.addEventListener("click",async e=>{const b=e.target.closest("[data-rate-order]");if(!b)return;const id=b.dataset.rateOrder,rating=Number(b.dataset.rating);try{const data=await api('/api/customer/orders/'+encodeURIComponent(id)+'/rating',{method:'POST',body:JSON.stringify({rating})});ratings[id]=data.rating;renderOrders();toast('Thanks for rating your order!')}catch(err){toast(err.message||'Could not save rating')}});
   async function respondToSplitRequest(id,action){
-    const u=user();if(!u||u.role!=="customer"||!token())throw new Error('Please sign in as the customer receiving this request.');
+    const u=user();if(!u||u.role!=="customer"||!token('/api/customer/split-bill/requests/'+encodeURIComponent(id)+'/respond'))throw new Error('Please sign in as the customer receiving this request.');
     const current=splitRequests.find(r=>Number(r.id)===Number(id));
     if(current&&current.direction!=='incoming')throw new Error('This payment request belongs to another customer.');
     try{const d=await api('/api/customer/split-bill/requests/'+encodeURIComponent(id)+'/respond',{method:'POST',body:JSON.stringify({action})});if(action==='approve')toast('Split bill approved — wallet debited ₹'+Number(d.amount||0).toLocaleString('en-IN'));else toast('Split bill request rejected');await loadCustomerState(true);return d;}catch(e){if(/Forbidden|recipient|Unauthorized|session/i.test(String(e.message||'')))await loadCustomerState(true).catch(()=>{});throw e;}
@@ -1323,14 +1367,23 @@ window.addEventListener("load",()=>{
     catch(err){toast(err?.message||'Could not process split bill request');}
     finally{splitActionBusy=false;buttons.forEach(x=>x.disabled=false);}
   });
-  function setSession(session){
-    localStorage.setItem("campusBiteRoleSession",JSON.stringify(session));
+  function setSession(session,jwtToken){
+    const role=String(session?.role||'').toLowerCase();
+    if(jwtToken){
+      sessionStorage.setItem(ACTIVE_TOKEN_KEY,jwtToken);
+      sessionStorage.setItem(role==='customer'?CUSTOMER_TOKEN_KEY:role==='staff'?STAFF_TOKEN_KEY:TOKEN_KEY,jwtToken);
+    }
+    // Only one role is active in a tab. Remove the other role's token so a stale
+    // credential can never be selected for a protected action.
+    sessionStorage.removeItem(role==='customer'?STAFF_TOKEN_KEY:CUSTOMER_TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.setItem("campusBiteRoleSession",JSON.stringify(session));
     if(typeof window.campusBiteSetRoleSession==="function") window.campusBiteSetRoleSession(session);
     if(typeof window.campusBiteHideGate==="function") window.campusBiteHideGate();
     document.body.classList.toggle("staff-mode",session.role==="staff");
     document.body.classList.toggle("customer-mode",session.role==="customer");
   }
-  function clearSession(){wallet=0;orders=[];transactions=[];splitRequests=[];ratings={};localStorage.removeItem(TOKEN_KEY);localStorage.removeItem("campusBiteRoleSession");if(typeof window.campusBiteSetRoleSession==="function")window.campusBiteSetRoleSession(null);document.body.classList.remove("staff-mode","customer-mode");if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();}
+  function clearSession(){wallet=0;orders=[];transactions=[];splitRequests=[];ratings={};sessionStorage.removeItem(TOKEN_KEY);sessionStorage.removeItem(ACTIVE_TOKEN_KEY);sessionStorage.removeItem(CUSTOMER_TOKEN_KEY);sessionStorage.removeItem(STAFF_TOKEN_KEY);sessionStorage.removeItem("campusBiteRoleSession");if(typeof window.campusBiteSetRoleSession==="function")window.campusBiteSetRoleSession(null);document.body.classList.remove("staff-mode","customer-mode");if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();}
   function mapOrder(o){return {id:o.id,items:o.items||[],total:Number(o.total||0),status:Number(o.status||0),discount:Number(o.discount||0),slot:o.slot||"ASAP",shop:o.shop||"Reo Store",createdAt:o.createdAt,prepStartedAt:o.prepStartedAt||null,readyAt:o.readyAt||null,completedAt:o.completedAt||null,customerName:o.customerName||null,customerCode:o.customerCode||null}}
   // Staff queue priority: pickup times that are due now/overdue come first, then the nearest upcoming pickup.
   // ASAP orders are treated as due now. Invalid/missing slots fall back to their creation time.
@@ -1374,29 +1427,84 @@ window.addEventListener("load",()=>{
     if(typeof renderWallet==='function')renderWallet();
   }
   async function loadCustomerState(silent=false){
-    if(!token()||user()?.role!=="customer"||syncing||splitActionBusy)return;
+    if(!token('/api/customer/state')||user()?.role!=="customer"||syncing||splitActionBusy)return;
     syncing=true;
     try{const st=await api('/api/customer/state');hydrateState(st);}
     catch(e){if(!silent)toast(e.message||"Could not load account data");}
     finally{syncing=false;}
   }
+  function applyServerMenuItem(x){
+    if(!x||x.id==null)return false;
+    const item=MENU.find(m=>Number(m.id)===Number(x.id));
+    if(!item)return false;
+    let changed=false;
+    if(x.available!=null){const v=!!x.available;if(item.available!==v){item.available=v;changed=true;}}
+    if(x.price!=null){const v=Number(x.price);if(item.price!==v){item.price=v;changed=true;}}
+    if(x.stock!=null){const v=Number(x.stock);if(item.stock!==v){item.stock=v;changed=true;}}
+    return changed;
+  }
+  function renderLiveMenu(){
+    // Rendering is deliberately independent of the current button/click state.
+    // A server menu mutation must be visible as soon as its event arrives.
+    try{if(typeof renderHome==='function')renderHome();}catch(e){}
+    try{if(typeof renderMenu==='function')renderMenu();}catch(e){}
+    try{if(typeof renderCart==='function')renderCart();}catch(e){}
+  }
+  function startMenuRealtime(){
+    if(menuRealtimeSource)return;
+    if(!('EventSource' in window)){
+      clearInterval(menuRealtimeFallbackTimer);
+      menuRealtimeFallbackTimer=setInterval(()=>loadMenu(),3000);
+      return;
+    }
+    try{
+      menuRealtimeSource=new EventSource('/api/menu/events');
+      menuRealtimeSource.onopen=()=>{loadMenu().catch(()=>{});};
+      menuRealtimeSource.onmessage=e=>{
+        try{
+          const changed=applyServerMenuItem(JSON.parse(e.data));
+          if(changed){
+            const u=user();
+            if(u?.role==='customer')renderLiveMenu();
+            if(u?.role==='staff' && typeof renderStaffMenuOnly==='function')renderStaffMenuOnly();
+          }
+        }catch(err){}
+      };
+      menuRealtimeSource.onerror=()=>{
+        // EventSource automatically reconnects. Keep a low-frequency fallback
+        // only while disconnected so a proxy/server restart cannot leave stale UI.
+        clearInterval(menuRealtimeFallbackTimer);
+        menuRealtimeFallbackTimer=setInterval(()=>loadMenu(),5000);
+      };
+    }catch(e){
+      menuRealtimeSource=null;
+      clearInterval(menuRealtimeFallbackTimer);
+      menuRealtimeFallbackTimer=setInterval(()=>loadMenu(),3000);
+    }
+  }
   async function loadMenu(){
-    try{const data=await api('/api/menu');const byId=new Map((data.items||[]).map(x=>[Number(x.id),x]));MENU.forEach(m=>{const x=byId.get(Number(m.id));if(x){m.available=!!x.available;if(x.price!=null)m.price=Number(x.price);if(x.stock!=null)m.stock=Number(x.stock);}});if(typeof renderHome==='function')renderHome();if(typeof renderMenu==='function')renderMenu();}
+    try{const data=await api('/api/menu');let changed=false;(data.items||[]).forEach(x=>{changed=applyServerMenuItem(x)||changed;});if(changed){renderLiveMenu();}else{if(typeof renderHome==='function')renderHome();if(typeof renderMenu==='function')renderMenu();}}
     catch(e){}
   }
   function indiaToday(){return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date())}
   async function customerLogin(){
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem("campusBiteRoleSession");
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(ACTIVE_TOKEN_KEY);
+    sessionStorage.removeItem(CUSTOMER_TOKEN_KEY);
+    sessionStorage.removeItem(STAFF_TOKEN_KEY);
+    sessionStorage.removeItem(ACTIVE_TOKEN_KEY);
+    sessionStorage.removeItem("campusBiteRoleSession");
     const reg=$('customerCodeInput').value.trim(),pw=$('customerPassword').value.trim(),profileRole=$('customerRoleInput').value,err=$('customerError');
-    try{const d=await api('/api/auth/customer',{method:'POST',body:JSON.stringify({customerCode:reg,password:pw,role:profileRole})});localStorage.setItem(TOKEN_KEY,d.token);setSession(d.user);await loadCustomerState();await loadMenu();view('home');toast('Welcome back, '+d.user.name.split(/\s+/)[0]+' 👋');startPolling();}
+    try{const d=await api('/api/auth/customer',{method:'POST',body:JSON.stringify({customerCode:reg,password:pw,role:profileRole})});setSession(d.user,d.token);await loadCustomerState();await loadMenu();view('home');toast('Welcome back, '+d.user.name.split(/\s+/)[0]+' 👋');startPolling();}
     catch(e){if(err){err.textContent=e.message||'Invalid customer ID or password.';err.style.display='block';}else toast(e.message||'Login failed');}
   }
   async function staffLogin(){
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem("campusBiteRoleSession");
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(STAFF_TOKEN_KEY);
+    sessionStorage.removeItem(CUSTOMER_TOKEN_KEY);
+    sessionStorage.removeItem("campusBiteRoleSession");
     const name=$('staffName').value.trim(),shop=$('staffShop').value,pin=$('staffPin').value.trim(),err=$('staffError');
-    try{const d=await api('/api/auth/staff',{method:'POST',body:JSON.stringify({name,shop,pin})});localStorage.setItem(TOKEN_KEY,d.token);setSession(d.user);view('staff');await loadStaff();startPolling();toast(d.user.shop+' staff console ready');}
+    try{const d=await api('/api/auth/staff',{method:'POST',body:JSON.stringify({name,shop,pin})});setSession(d.user,d.token);view('staff');await loadStaff();startPolling();toast(d.user.shop+' staff console ready');}
     catch(e){if(err){err.textContent=e.message||'Invalid staff PIN.';err.style.display='block';}else toast(e.message||'Staff login failed');}
   }
   function updateSplitBillPreview(){
@@ -1465,7 +1573,7 @@ window.addEventListener("load",()=>{
     }catch(e){}
   }
   async function loadStaff(){
-    if(!token()||user()?.role!=="staff")return;
+    if(!token('/api/staff/orders')||user()?.role!=="staff")return;
     try{
       const shop=user().shop;
       // Keep the live order queue independent from optional dashboard metrics.
@@ -1512,18 +1620,14 @@ window.addEventListener("load",()=>{
     const ap=$('autoPayBtn');if(ap)ap.onclick=saveAutopay;
     const lg=$('logoutBtn');if(lg)lg.onclick=clearSession;
     resetMismatchedSession();
-    const saved=user();if(saved&&token()){if(saved.role==='customer'){loadCustomerState();loadMenu();view('home');}else if(saved.role==='staff'){view('staff');loadStaff();}startPolling();}else if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();
+    const saved=user();if(saved&&token(saved.role==='customer'?'/api/customer/state':saved.role==='staff'?'/api/staff/orders':'')){if(saved.role==='customer'){loadCustomerState();loadMenu();view('home');}else if(saved.role==='staff'){view('staff');loadStaff();}startPolling();}else if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();
   }
   if(!window.campusBiteMenuAvailabilityListenersBound){
     window.campusBiteMenuAvailabilityListenersBound=true;
     const applyAvailabilitySignal=payload=>{
       if(!payload||payload.type!=="menu-availability-changed")return;
       const item=MENU.find(x=>Number(x.id)===Number(payload.id));
-      if(item)item.available=!!payload.available;
-      const u=user();
-      if(u?.role==="customer"&&!$("checkoutModal")?.classList.contains("open")&&!$("cart")?.classList.contains("active")){
-        loadMenu().catch(()=>{});
-      }
+      if(item){item.available=!!payload.available;renderLiveMenu();}
     };
     window.addEventListener("storage",e=>{if(e.key==="campusBiteMenuAvailabilityChange"){try{applyAvailabilitySignal(JSON.parse(e.newValue||"null"));}catch(err){}}});
     try{
@@ -1533,13 +1637,16 @@ window.addEventListener("load",()=>{
       }
     }catch(e){}
   }
-  window.campusBiteApi=api;
   window.campusBiteApi.loadCustomerState=loadCustomerState;
   window.campusBiteApi.loadStaff=loadStaff;
   window.campusBiteApi.loadMenu=loadMenu;
   window.campusBiteLogout=clearSession;
   window.campusBiteCheckAutoPay=async()=>false;
-  window.addEventListener('load',()=>setTimeout(wire,250));
+  window.addEventListener('load',()=>{
+    setTimeout(wire,250);
+    // Establish the menu event stream independently of authentication and UI clicks.
+    setTimeout(startMenuRealtime,350);
+  });
 })();
 </script>
 </body>

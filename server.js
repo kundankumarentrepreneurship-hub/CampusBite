@@ -17,7 +17,18 @@ const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, max: 10, 
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders(res, filePath){
+    // index.html contains the complete application bundle. Prevent browsers
+    // and proxies from retaining an older authentication/payment implementation
+    // after a deployment. API endpoints already send their own no-store headers.
+    if(path.basename(filePath).toLowerCase()==='index.html'){
+      res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma','no-cache');
+      res.setHeader('Expires','0');
+    }
+  }
+}));
 
 const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 const shops = ['Hari Sandwich','Reo Store','Campus Café'];
@@ -240,6 +251,37 @@ function auth(req,res,next){
   }catch{res.status(401).json({error:'Unauthorized'});}
 }
 function role(r){return (req,res,next)=>{if(req.user?.role!==r)return res.status(403).json({error:'Forbidden'});next();};}
+
+// Customer authentication is intentionally resilient to tokens issued by an
+// older CampusBite build.  A signed token that carries a valid customer id
+// and customerCode is still a customer credential even if its legacy role
+// claim is stale.  This prevents a post-login checkout from being rejected
+// with 403 while keeping the JWT signature as the trust boundary.
+async function customerRole(req,res,next){
+  // NEVER authorize a customer endpoint from the JWT role claim alone.
+  // Older CampusBite sessions may contain a stale/mismatched role claim, which
+  // was the source of the intermittent post-login 403 on checkout/payment.
+  // The JWT signature proves the credential was issued by CampusBite; the
+  // customer id + customer code are then resolved against the live database.
+  try{
+    const id=Number(req.user?.id);
+    const code=String(req.user?.customerCode||'').trim();
+    if(!Number.isInteger(id)||id<=0||!code){
+      return res.status(403).json({error:'Customer authentication is invalid. Please sign in again.',code:'CUSTOMER_AUTH_INVALID'});
+    }
+    const d=await db();
+    const r=(await d.query('SELECT id,customer_code,role FROM customers WHERE id=$1 AND customer_code=$2',[id,code])).rows[0];
+    if(!r){
+      return res.status(403).json({error:'Customer account could not be verified. Please sign in again.',code:'CUSTOMER_AUTH_INVALID'});
+    }
+    // Normalize the request identity from PostgreSQL, not from mutable client state.
+    req.user={...req.user,role:'customer',id:Number(r.id),customerCode:r.customer_code};
+    return next();
+  }catch(e){
+    console.error('Customer authentication error:',e);
+    return res.status(503).json({error:'Customer authentication service is temporarily unavailable. Please try again.',code:'CUSTOMER_AUTH_UNAVAILABLE'});
+  }
+}
 function serializeOrder(r){return {id:r.public_id,items:r.items,total:Number(r.total),status:Number(r.status),discount:Number(r.discount),slot:r.slot,shop:r.shop,createdAt:new Date(r.created_at).getTime(),prepStartedAt:r.prep_started_at?new Date(r.prep_started_at).getTime():null,readyAt:r.ready_at?new Date(r.ready_at).getTime():null,completedAt:r.completed_at?new Date(r.completed_at).getTime():null,customerName:r.customer_name||null,customerCode:r.customer_code||null};}
 function serializeTx(r){return {icon:r.icon,title:r.title,sub:r.sub,shop:r.order_shop||'',food:r.order_food||'',amt:Number(r.amount),type:r.type,createdAt:new Date(r.created_at).getTime()};}
 
@@ -271,7 +313,7 @@ app.post('/api/auth/staff',async(req,res)=>{
   }catch(e){console.error(e);res.status(500).json({error:'Staff login unavailable'});}
 });
 
-app.get('/api/customer/state',auth,role('customer'),async(req,res)=>{
+app.get('/api/customer/state',auth,customerRole,async(req,res)=>{
   try{const d=await db(); const s=(await d.query('SELECT * FROM customers WHERE id=$1',[req.user.id])).rows[0]; if(!s)return res.status(404).json({error:'Customer not found'});
     const os=(await d.query('SELECT * FROM orders WHERE customer_id=$1 ORDER BY created_at DESC',[s.id])).rows;
     const tx=(await d.query(`SELECT wt.*, o.shop AS order_shop, COALESCE((SELECT string_agg(item->>'name',' • ' ORDER BY ord) FROM jsonb_array_elements(o.items) WITH ORDINALITY AS a(item,ord)), '') AS order_food FROM wallet_transactions wt LEFT JOIN orders o ON o.id=wt.order_id WHERE wt.customer_id=$1 ORDER BY wt.created_at DESC LIMIT 100`,[s.id])).rows;
@@ -309,7 +351,7 @@ async function validateOrderForRequest(client, reqUserId, body){
   return {normalized,quantities,storedItems,discount,payable,slot:String(slot||'ASAP'),shop};
 }
 
-app.post('/api/customer/order',auth,role('customer'),async(req,res)=>{
+app.post('/api/customer/order',auth,customerRole,async(req,res)=>{
   let client=null;
   let inTransaction=false;
   try{
@@ -371,7 +413,7 @@ app.post('/api/customer/order',auth,role('customer'),async(req,res)=>{
   }finally{if(client)client.release();}
 });
 
-app.post('/api/customer/split-bill/requests/:id/respond',auth,role('customer'),async(req,res)=>{
+app.post('/api/customer/split-bill/requests/:id/respond',auth,customerRole,async(req,res)=>{
   const client=await (await db()).connect();
   try{
     const action=String(req.body.action||'').toLowerCase();
@@ -418,7 +460,7 @@ app.post('/api/customer/split-bill/requests/:id/respond',auth,role('customer'),a
   }catch(e){await client.query('ROLLBACK');console.error(e);res.status(e.status||500).json({error:e.message||'Could not process split bill request'});}finally{client.release();}
 });
 
-app.post('/api/customer/orders/:id/rating',auth,role('customer'),async(req,res)=>{
+app.post('/api/customer/orders/:id/rating',auth,customerRole,async(req,res)=>{
   try{
     const rating=Number(req.body.rating);
     if(!Number.isInteger(rating)||rating<1||rating>5)return res.status(400).json({error:'Rating must be between 1 and 5'});
@@ -434,8 +476,8 @@ app.post('/api/customer/orders/:id/rating',auth,role('customer'),async(req,res)=
   }catch(e){console.error(e);res.status(500).json({error:'Could not save rating'});}
 });
 
-app.post('/api/customer/wallet/topup',auth,role('customer'),async(req,res)=>{try{const d=await db(),amount=Number(req.body.amount);if(![250,500,1000,2000].includes(amount))return res.status(400).json({error:'Invalid amount'});await d.query('UPDATE customers SET wallet_balance=wallet_balance+$1 WHERE id=$2',[amount,req.user.id]);await d.query(`INSERT INTO wallet_transactions(customer_id,icon,title,sub,amount,type) VALUES($1,'💰','Wallet top-up','Demo wallet load',$2,'credit')`,[req.user.id,amount]);const s=(await d.query('SELECT wallet_balance FROM customers WHERE id=$1',[req.user.id])).rows[0];res.json({wallet:Number(s.wallet_balance)});}catch(e){console.error(e);res.status(500).json({error:'Top-up failed'});}});
-app.post('/api/customer/autopay',auth,role('customer'),async(req,res)=>{const client=await (await db()).connect();try{const enabled=!!req.body.enabled,threshold=Number(req.body.threshold)||200,amount=Number(req.body.amount)||500;await client.query('BEGIN');const s=(await client.query('SELECT * FROM customers WHERE id=$1 FOR UPDATE',[req.user.id])).rows[0];if(!s)throw new Error('Customer not found');await client.query('UPDATE customers SET autopay_enabled=$1,autopay_threshold=$2,autopay_amount=$3 WHERE id=$4',[enabled,threshold,amount,req.user.id]);let balance=Number(s.wallet_balance);if(enabled && balance<=threshold){balance+=amount;await client.query('UPDATE customers SET wallet_balance=wallet_balance+$1 WHERE id=$2',[amount,req.user.id]);await client.query(`INSERT INTO wallet_transactions(customer_id,icon,title,sub,amount,type) VALUES($1,'🔄','Auto-pay top-up',$2,$3,'credit')`,[req.user.id,`Automatic refill • threshold ₹${threshold}`,amount]);}await client.query('COMMIT');res.json({autopay:{enabled,threshold,amount},wallet:balance});}catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({error:'Auto-pay update failed'});}finally{client.release();}});
+app.post('/api/customer/wallet/topup',auth,customerRole,async(req,res)=>{try{const d=await db(),amount=Number(req.body.amount);if(![250,500,1000,2000].includes(amount))return res.status(400).json({error:'Invalid amount'});await d.query('UPDATE customers SET wallet_balance=wallet_balance+$1 WHERE id=$2',[amount,req.user.id]);await d.query(`INSERT INTO wallet_transactions(customer_id,icon,title,sub,amount,type) VALUES($1,'💰','Wallet top-up','Demo wallet load',$2,'credit')`,[req.user.id,amount]);const s=(await d.query('SELECT wallet_balance FROM customers WHERE id=$1',[req.user.id])).rows[0];res.json({wallet:Number(s.wallet_balance)});}catch(e){console.error(e);res.status(500).json({error:'Top-up failed'});}});
+app.post('/api/customer/autopay',auth,customerRole,async(req,res)=>{const client=await (await db()).connect();try{const enabled=!!req.body.enabled,threshold=Number(req.body.threshold)||200,amount=Number(req.body.amount)||500;await client.query('BEGIN');const s=(await client.query('SELECT * FROM customers WHERE id=$1 FOR UPDATE',[req.user.id])).rows[0];if(!s)throw new Error('Customer not found');await client.query('UPDATE customers SET autopay_enabled=$1,autopay_threshold=$2,autopay_amount=$3 WHERE id=$4',[enabled,threshold,amount,req.user.id]);let balance=Number(s.wallet_balance);if(enabled && balance<=threshold){balance+=amount;await client.query('UPDATE customers SET wallet_balance=wallet_balance+$1 WHERE id=$2',[amount,req.user.id]);await client.query(`INSERT INTO wallet_transactions(customer_id,icon,title,sub,amount,type) VALUES($1,'🔄','Auto-pay top-up',$2,$3,'credit')`,[req.user.id,`Automatic refill • threshold ₹${threshold}`,amount]);}await client.query('COMMIT');res.json({autopay:{enabled,threshold,amount},wallet:balance});}catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({error:'Auto-pay update failed'});}finally{client.release();}});
 
 
 app.get('/api/menu',async(req,res)=>{try{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');const d=await db();const rows=(await d.query('SELECT id,shop,name,price,stock,available FROM menu_items ORDER BY id')).rows;res.json({items:rows});}catch(e){console.error(e);res.status(500).json({error:'Menu unavailable'});}});
@@ -480,6 +522,7 @@ const server = app.listen(PORT,'0.0.0.0',()=>{
         await init();
         dbReady=true;
         console.log('CampusBite database initialization complete');
+        startMenuRealtimeListener().catch(e=>console.error('Menu realtime startup failed',e));
       }catch(e){
         console.error('CampusBite database initialization failed:',e);
         console.log('Retrying database initialization in 5 seconds...');
