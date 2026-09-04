@@ -572,19 +572,8 @@ body.staff-mode .staff-only-label{display:inline-flex;align-items:center}
  <div class="dashboard"><div class="metric">Orders<b id="sOrders">24</b><span class="muted">today</span></div><div class="metric">Revenue<b id="sRevenue">₹3,480</b><span class="muted">today</span></div><div class="metric">Prep time<b id="sPrepTime">5.0 min</b><span class="muted">average</span></div><div class="metric">Queue<b id="sQueue">0</b><span class="muted">active</span></div></div>
  <div class="staff-rating-card" aria-label="Shop average customer rating"><div class="staff-rating-label">Average shop rating</div><div class="staff-rating-value"><div id="staffRatingStars" class="staff-rating-stars" aria-hidden="true"></div><span id="staffRatingNumber" class="staff-rating-number">— / 5</span></div></div>
  <div class="section"><h2>Live kitchen queue</h2><span class="muted">Advance orders as prepared</span></div><div class="card"><div id="queue" class="staffQueue"></div></div>
- <div class="section">
-  <h2>♻️ Food Waste Helper</h2>
-  <span class="muted" id="simpleWasteShop">Simple preparation advice</span>
-</div>
 <div class="simpleWasteCard">
-  <div class="simpleWasteIntro">
-    <b>What should we prepare tomorrow?</b>
-    <span>Based on today's sales and what is left.</span>
-  </div>
   <div id="simpleWasteRecommendations"></div>
-  <div class="simpleWasteTip">
-    💡 <b>Simple tip:</b> Make more of food that finishes quickly. Make less of food that is left over.
-  </div>
 </div>
 <div class="section"><h2>Menu control</h2></div><div class="card" id="menuControl"></div>
 </section>
@@ -898,7 +887,6 @@ function renderWasteIntelligence(shop){
   });
 
   const totalUnitsSold=Object.values(soldToday).reduce((a,b)=>a+b,0);
-  $('simpleWasteShop').textContent='Demand-based preparation guidance • '+totalUnitsSold+' food items sold today';
 
   $('simpleWasteRecommendations').innerHTML=`<div class="simpleWasteHeader"><div><div class="simpleWasteTitle">♻️ Food Waste Helper</div><div class="simpleWasteShop">${shop} • live demand guidance</div></div><span class="simpleWasteLive">LIVE DATA</span></div>`+recommendations.map(r=>`
     <div class="simpleWasteItem">
@@ -1464,6 +1452,18 @@ window.addEventListener("load",()=>{
     try{const d=await api('/api/customer/autopay',{method:'POST',body:JSON.stringify(next)});window.campusBiteAutoPay=d.autopay||next;if(d.wallet!=null)wallet=Number(d.wallet);await loadCustomerState(true);toast(d.autopay?.enabled?'Auto-pay enabled':'Auto-pay disabled');}
     catch(e){toast(e.message||'Auto-pay update failed');}
   }
+  function broadcastAvailabilityChange(item){
+    // Keep availability changes synchronized across open CampusBite tabs.
+    // The server remains the source of truth; this is only a fast UI signal.
+    const payload={type:"menu-availability-changed",id:Number(item.id),available:!!item.available,updatedAt:Date.now()};
+    try{localStorage.setItem("campusBiteMenuAvailabilityChange",JSON.stringify(payload));}catch(e){}
+    try{
+      if("BroadcastChannel" in window){
+        if(!window.campusBiteMenuChannel)window.campusBiteMenuChannel=new BroadcastChannel("campusBite-menu-availability");
+        window.campusBiteMenuChannel.postMessage(payload);
+      }
+    }catch(e){}
+  }
   async function loadStaff(){
     if(!token()||user()?.role!=="staff")return;
     try{
@@ -1513,6 +1513,25 @@ window.addEventListener("load",()=>{
     const lg=$('logoutBtn');if(lg)lg.onclick=clearSession;
     resetMismatchedSession();
     const saved=user();if(saved&&token()){if(saved.role==='customer'){loadCustomerState();loadMenu();view('home');}else if(saved.role==='staff'){view('staff');loadStaff();}startPolling();}else if(typeof window.campusBiteShowGate==="function")window.campusBiteShowGate();
+  }
+  if(!window.campusBiteMenuAvailabilityListenersBound){
+    window.campusBiteMenuAvailabilityListenersBound=true;
+    const applyAvailabilitySignal=payload=>{
+      if(!payload||payload.type!=="menu-availability-changed")return;
+      const item=MENU.find(x=>Number(x.id)===Number(payload.id));
+      if(item)item.available=!!payload.available;
+      const u=user();
+      if(u?.role==="customer"&&!$("checkoutModal")?.classList.contains("open")&&!$("cart")?.classList.contains("active")){
+        loadMenu().catch(()=>{});
+      }
+    };
+    window.addEventListener("storage",e=>{if(e.key==="campusBiteMenuAvailabilityChange"){try{applyAvailabilitySignal(JSON.parse(e.newValue||"null"));}catch(err){}}});
+    try{
+      if("BroadcastChannel" in window){
+        window.campusBiteMenuChannel=new BroadcastChannel("campusBite-menu-availability");
+        window.campusBiteMenuChannel.onmessage=e=>applyAvailabilitySignal(e.data);
+      }
+    }catch(e){}
   }
   window.campusBiteApi=api;
   window.campusBiteApi.loadCustomerState=loadCustomerState;
